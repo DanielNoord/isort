@@ -101,3 +101,17 @@ jobs:
 
       - name: Test integration
         run: ./scripts/test_integration.sh
+
+  docs:
+    name: Build docs
+    runs-on: ubuntu-latest
+
+    steps:
+      - *checkout
+      - *setup-python
+
+      - name: Install docs dependencies
+        run: pip install -r docs/requirements.txt
+
+      - name: Build docs
+        run: mkdocs build --strict
