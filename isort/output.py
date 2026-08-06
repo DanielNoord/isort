@@ -464,8 +464,8 @@ def _with_from_imports(
                     else:
                         from_imports[idx : (idx + 1)] = as_imports.pop(from_import)
 
-        comments: list[str] | None = parsed.categorized_comments["from"].pop(module, None)
-        above_comments = parsed.categorized_comments["above"]["from"].pop(module, None)
+        comments: list[str] = parsed.categorized_comments["from"].pop(module, [])
+        above_comments = parsed.categorized_comments["above"]["from"].pop(module, [])
         if above_comments:
             output.extend(above_comments)
 
@@ -475,7 +475,7 @@ def _with_from_imports(
             output.append(
                 wrap.line(
                     with_comments(
-                        _with_star_comments(parsed, module, list(comments or ())),
+                        _with_star_comments(parsed, module, comments),
                         f"{import_start}*",
                         removed=config.ignore_comments,
                         comment_prefix=config.comment_prefix,
@@ -548,7 +548,7 @@ def _with_from_imports(
                         )
                 else:
                     output.append(wrap.line(single_import_line, parsed.line_separator, config))
-                comments = None
+                comments = []
 
         while from_imports:
             # Tracks whether any aliased imports were emitted before the grouped
@@ -595,60 +595,86 @@ def _with_from_imports(
                 )
                 from_imports.remove("*")
 
-            for from_import in copy.copy(from_imports):
-                comment = (
-                    parsed.categorized_comments["nested"].get(module, {}).pop(from_import, None)
+            aliased_from_imports = []
+            from_import_section = []
+            pending_from_imports = []
+            module_imports = parsed.imports[section][import_key][module]
+            nested_comments = parsed.categorized_comments["nested"].get(module, {})
+
+            while from_imports:
+                from_import = from_imports.pop(0)
+                if from_import in as_imports:
+                    aliased_from_imports.append(from_import)
+
+                include_in_from_import_section: bool = from_import not in as_imports or (
+                    module_imports[from_import] and not only_show_as_imports
                 )
-                if (
-                    comment is not None
-                    and from_import in as_imports
-                    and config.multi_line_output != wrap_modes.WrapModes.NOQA
-                ):
-                    # This name also has an alias; the leading-alias loop keeps the two
-                    # together on a later pass.  Popping the comment here would drop the
-                    # alias, so put it back and leave the name for that loop.
-                    parsed.categorized_comments["nested"].setdefault(module, {})[from_import] = (
-                        comment
-                    )
+                if not include_in_from_import_section:
                     continue
+
+                pending_from_imports.append(from_import)
+
+                comment = nested_comments.pop(from_import, None)
                 if comment is not None:
+                    comments.append(comment)
+
+                if comment is None or (
                     # If the comment is a noqa and hanging indent wrapping is used,
                     # keep the name in the main list and hoist the comment to the statement.
-                    if (
-                        comment.lower().startswith("noqa")
-                        and config.multi_line_output == wrap_modes.WrapModes.HANGING_INDENT
-                    ):
-                        comments = list(comments) if comments else []
-                        comments.append(comment)
+                    comment.lower().startswith("noqa")
+                    and config.multi_line_output is wrap_modes.WrapModes.HANGING_INDENT
+                ):
+                    continue
+
+                remaining_from_imports = []
+                for grouped_plain_import in from_imports:
+                    include_grouped_import = grouped_plain_import not in as_imports or (
+                        module_imports[grouped_plain_import] and not only_show_as_imports
+                    )
+                    if not include_grouped_import:
+                        remaining_from_imports.append(grouped_plain_import)
                         continue
 
-                    from_imports.remove(from_import)
-                    if from_imports:
-                        use_comments: list[str] | None = []
-                    else:
-                        use_comments = comments
-                        comments = None
-                    single_import_line = with_comments(
-                        use_comments,
-                        import_start + from_import,
-                        removed=config.ignore_comments,
-                        comment_prefix=config.comment_prefix,
-                    )
-                    comment_text = f" {comment}" if comment else ""
-                    single_import_line += (
-                        f"{(use_comments and ';') or config.comment_prefix}{comment_text}"
-                    )
-                    output.append(wrap.line(single_import_line, parsed.line_separator, config))
+                    if grouped_plain_import in as_imports:
+                        remaining_from_imports.append(grouped_plain_import)
 
-            from_import_section = []
-            while from_imports and (
-                from_imports[0] not in as_imports
-                or (
-                    config.combine_as_imports
-                    and parsed.imports[section][import_key][module][from_import]
+                    pending_from_imports.append(grouped_plain_import)
+                    grouped_comment = nested_comments.pop(grouped_plain_import, None)
+                    if grouped_comment is not None:
+                        comments.append(grouped_comment)
+
+                from_imports = remaining_from_imports
+                if from_imports:
+                    use_comments: list[str] = []
+                else:
+                    use_comments = comments
+                    comments = []
+
+                grouped_import_line = with_comments(
+                    use_comments,
+                    import_start + ", ".join(pending_from_imports),
+                    removed=config.ignore_comments,
+                    comment_prefix=config.comment_prefix,
                 )
-            ):
-                from_import_section.append(from_imports.pop(0))
+                if len(grouped_import_line) > config.line_length and any(
+                    grouped_comment.lower().startswith("noqa") for grouped_comment in use_comments
+                ):
+                    output.append(
+                        wrap.import_statement(
+                            import_start=import_start,
+                            from_imports=pending_from_imports,
+                            comments=use_comments,
+                            line_separator=parsed.line_separator,
+                            config=config,
+                        )
+                    )
+                else:
+                    output.append(wrap.line(grouped_import_line, parsed.line_separator, config))
+
+                pending_from_imports = []
+
+            from_import_section.extend(pending_from_imports)
+
             if config.combine_as_imports:
                 comments = (comments or []) + list(
                     parsed.categorized_comments["from"].pop(f"{module}.__combined_as__", ())
@@ -735,10 +761,28 @@ def _with_from_imports(
                         import_statement = other_import_statement
             elif len(import_statement) > config.line_length:
                 import_statement = wrap.line(import_statement, parsed.line_separator, config)
-            comments = None
+            comments = []
 
             if import_statement:
                 output.append(import_statement)
+
+            for from_import in aliased_from_imports:
+                # Handle all aliased (as) imports for this from import statement.
+                output.extend(
+                    _build_as_imports(
+                        from_import=from_import,
+                        as_imports=as_imports[from_import],
+                        import_start=import_start,
+                        line_separator=parsed.line_separator,
+                        config=config,
+                        straight_comments=parsed.categorized_comments["straight"].get(
+                            f"{module}.{from_import}", []
+                        ),
+                        nested_comments=parsed.categorized_comments["nested"].get(module, {}),
+                        include_straight_import=False,
+                    )
+                )
+
     return output
 
 
